@@ -7,12 +7,16 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"github.com/boltdb/bolt"
+	"github.com/micromdm/scep/v2/challenge"
+	boltchallenge "github.com/micromdm/scep/v2/challenge/bolt"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/micromdm/scep/v2/csrverifier"
 	executablecsrverifier "github.com/micromdm/scep/v2/csrverifier/executable"
@@ -42,18 +46,20 @@ func main() {
 
 	//main flags
 	var (
-		flVersion           = flag.Bool("version", false, "prints version information")
-		flHTTPAddr          = flag.String("http-addr", envString("SCEP_HTTP_ADDR", ""), "http listen address. defaults to \":8080\"")
-		flPort              = flag.String("port", envString("SCEP_HTTP_LISTEN_PORT", "8080"), "http port to listen on (if you want to specify an address, use -http-addr instead)")
-		flDepotPath         = flag.String("depot", envString("SCEP_FILE_DEPOT", "depot"), "path to ca folder")
-		flCAPass            = flag.String("capass", envString("SCEP_CA_PASS", ""), "passwd for the ca.key")
-		flClDuration        = flag.String("crtvalid", envString("SCEP_CERT_VALID", "365"), "validity for new client certificates in days")
-		flClAllowRenewal    = flag.String("allowrenew", envString("SCEP_CERT_RENEW", "14"), "do not allow renewal until n days before expiry, set to 0 to always allow")
-		flChallengePassword = flag.String("challenge", envString("SCEP_CHALLENGE_PASSWORD", ""), "enforce a challenge password")
-		flCSRVerifierExec   = flag.String("csrverifierexec", envString("SCEP_CSR_VERIFIER_EXEC", ""), "will be passed the CSRs for verification")
-		flDebug             = flag.Bool("debug", envBool("SCEP_LOG_DEBUG"), "enable debug logging")
-		flLogJSON           = flag.Bool("log-json", envBool("SCEP_LOG_JSON"), "output JSON logs")
-		flSignServerAttrs   = flag.Bool("sign-server-attrs", envBool("SCEP_SIGN_SERVER_ATTRS"), "sign cert attrs for server usage")
+		flVersion             = flag.Bool("version", false, "prints version information")
+		flHTTPAddr            = flag.String("http-addr", envString("SCEP_HTTP_ADDR", ""), "http listen address. defaults to \":8080\"")
+		flPort                = flag.String("port", envString("SCEP_HTTP_LISTEN_PORT", "8080"), "http port to listen on (if you want to specify an address, use -http-addr instead)")
+		flDepotPath           = flag.String("depot", envString("SCEP_FILE_DEPOT", "depot"), "path to ca folder")
+		flCAPass              = flag.String("capass", envString("SCEP_CA_PASS", ""), "passwd for the ca.key")
+		flClDuration          = flag.String("crtvalid", envString("SCEP_CERT_VALID", "365"), "validity for new client certificates in days")
+		flClAllowRenewal      = flag.String("allowrenew", envString("SCEP_CERT_RENEW", "14"), "do not allow renewal until n days before expiry, set to 0 to always allow")
+		flChallengePassword   = flag.String("challenge", envString("SCEP_CHALLENGE_PASSWORD", ""), "enforce a challenge password")
+		flUseDynSCEPChallenge = flag.Bool("dynamic-challenge", envBool("SCEP_DYNAMIC_CHALLENGE"), "enforce dynamic challenge in SCEP")
+		flCSRVerifierExec     = flag.String("csrverifierexec", envString("SCEP_CSR_VERIFIER_EXEC", ""), "will be passed the CSRs for verification")
+		flDebug               = flag.Bool("debug", envBool("SCEP_LOG_DEBUG"), "enable debug logging")
+		flLogJSON             = flag.Bool("log-json", envBool("SCEP_LOG_JSON"), "output JSON logs")
+		flSignServerAttrs     = flag.Bool("sign-server-attrs", envBool("SCEP_SIGN_SERVER_ATTRS"), "sign cert attrs for server usage")
+		flDBPath              = flag.String("db-path", envString("SCEP_DB_PATH", "/var/db/scepserver"), "Path to scep db directory")
 	)
 	flag.Usage = func() {
 		flag.PrintDefaults()
@@ -127,6 +133,21 @@ func main() {
 		}
 		csrVerifier = executableCSRVerifier
 	}
+	var SCEPChallengeDepot *boltchallenge.Depot
+
+	if *flUseDynSCEPChallenge {
+		dbPath := filepath.Join(*flDBPath, "scep.db")
+		DB, err := bolt.Open(dbPath, 0644, &bolt.Options{Timeout: time.Second})
+		if err != nil {
+			lginfo.Log("err", err)
+			os.Exit(1)
+		}
+		SCEPChallengeDepot, err = boltchallenge.NewBoltDepot(DB)
+		if err != nil {
+			lginfo.Log("err", err)
+			os.Exit(1)
+		}
+	}
 
 	var svc scepserver.Service // scep service
 	{
@@ -148,8 +169,12 @@ func main() {
 			signerOpts = append(signerOpts, scepdepot.WithSeverAttrs())
 		}
 		var signer scepserver.CSRSigner = scepdepot.NewSigner(depot, signerOpts...)
-		if *flChallengePassword != "" {
-			signer = scepserver.ChallengeMiddleware(*flChallengePassword, signer)
+		if *flUseDynSCEPChallenge {
+			signer = challenge.Middleware(SCEPChallengeDepot, signer)
+		} else {
+			if *flChallengePassword != "" {
+				signer = scepserver.ChallengeMiddleware(*flChallengePassword, signer)
+			}
 		}
 		if csrVerifier != nil {
 			signer = csrverifier.Middleware(csrVerifier, signer)
@@ -167,6 +192,9 @@ func main() {
 		e := scepserver.MakeServerEndpoints(svc)
 		e.GetEndpoint = scepserver.EndpointLoggingMiddleware(lginfo)(e.GetEndpoint)
 		e.PostEndpoint = scepserver.EndpointLoggingMiddleware(lginfo)(e.PostEndpoint)
+		if *flUseDynSCEPChallenge {
+			e.ChallengeEndpoint = challenge.MakeChallengeEndpoint(challenge.NewService(SCEPChallengeDepot))
+		}
 		h = scepserver.MakeHTTPHandler(e, svc, log.With(lginfo, "component", "http"))
 	}
 

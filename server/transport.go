@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"github.com/micromdm/micromdm/pkg/httputil"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -34,6 +35,13 @@ func MakeHTTPHandler(e *Endpoints, svc Service, logger kitlog.Logger) http.Handl
 		e.PostEndpoint,
 		decodeSCEPRequest,
 		encodeSCEPResponse,
+		opts...,
+	))
+
+	r.Methods("POST").Path("/v1/challenge").Handler(kithttp.NewServer(
+		e.ChallengeEndpoint,
+		decodeEmptyRequest,
+		httputil.EncodeJSONResponse,
 		opts...,
 	))
 
@@ -174,4 +182,8 @@ func contentHeader(op string, certNum int) string {
 	default:
 		return "text/plain"
 	}
+}
+
+func decodeEmptyRequest(ctx context.Context, r *http.Request) (interface{}, error) {
+	return nil, nil
 }

@@ -2,8 +2,11 @@
 package challenge
 
 import (
+	"context"
 	"crypto/x509"
 	"errors"
+
+	"github.com/go-kit/kit/endpoint"
 
 	"github.com/micromdm/scep/v2/scep"
 	scepserver "github.com/micromdm/scep/v2/server"
@@ -27,5 +30,20 @@ func Middleware(store Store, next scepserver.CSRSigner) scepserver.CSRSignerFunc
 			return nil, errors.New("invalid challenge")
 		}
 		return next.SignCSR(m)
+	}
+}
+
+type challengeResponse struct {
+	Challenge string `json:"string"`
+	Err       error  `json:"err,omitempty"`
+}
+
+func (r challengeResponse) Failed() error { return r.Err }
+
+func MakeChallengeEndpoint(svc Service) endpoint.Endpoint {
+	return func(ctx context.Context, request interface{}) (response interface{}, err error) {
+		r := challengeResponse{}
+		r.Challenge, r.Err = svc.SCEPChallenge(ctx)
+		return r, nil
 	}
 }
